@@ -157,8 +157,13 @@ void receive_file_gobackn(int sockfd, sockaddr_in &serv, const string &filename)
     int packets_dropped = 0;
     uint32_t bytes_written = 0;
     uint32_t acks_sent = 0;
-
+    int consecutive_timeouts = 0;
+    const int MAX_CONSECUTIVE_TIMEOUTS = 3;
+    const int PACKET_TIMEOUT_SEC = 5;  // Reduced timeout for faster detection
+    
     cout << "=== Packet Loss Simulation Active (10% loss rate) ===" << endl;
+    cout << "=== Server Disconnection Detection: " << MAX_CONSECUTIVE_TIMEOUTS 
+         << " consecutive timeouts (max " << PACKET_TIMEOUT_SEC << "s each) ===" << endl;
 
     while (true) {
         Packet packet;
@@ -167,29 +172,64 @@ void receive_file_gobackn(int sockfd, sockaddr_in &serv, const string &filename)
         FD_SET(sockfd, &read_fds);
 
         struct timeval timeout;
-        timeout.tv_sec = 5;  // Increased timeout for large files
+        timeout.tv_sec = PACKET_TIMEOUT_SEC;
         timeout.tv_usec = 0;
 
+        cout << "Waiting for packet " << expected_seq << "..." << endl;
         int activity = select(sockfd + 1, &read_fds, NULL, NULL, &timeout);
+        
         if (activity == 0) {
-            cout << "TIMEOUT waiting for packet " << expected_seq 
-                 << ". Connection may be lost or transfer complete." << endl;
+            consecutive_timeouts++;
+            cout << " TIMEOUT #" << consecutive_timeouts << "/" << MAX_CONSECUTIVE_TIMEOUTS 
+                 << " waiting for packet " << expected_seq << endl;
             
-            // Send one more ACK in case last ACK was lost
+            // Try to request retransmission of current packet
             if (expected_seq > 0) {
                 uint32_t last_ack = expected_seq - 1;
                 sendto(sockfd, &last_ack, sizeof(last_ack), 0, (sockaddr*)&serv, len);
-                cout << "Sent final ACK: " << last_ack << endl;
+                cout << "Sent retransmission request (ACK " << last_ack << ")" << endl;
             }
+            
+            if (consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
+                cout << "\n SERVER DISCONNECTION DETECTED!" << endl;
+                cout << "Server appears to have been terminated during transmission." << endl;
+                cout << "Transfer incomplete after " << (consecutive_timeouts * PACKET_TIMEOUT_SEC) 
+                     << " seconds of no response." << endl;
+                
+                // Save partial file with different name
+                output.close();
+                string partial_filename = output_filename + ".PARTIAL";
+                if (rename(output_filename.c_str(), partial_filename.c_str()) == 0) {
+                    cout << "Partial file saved as: " << partial_filename << endl;
+                    cout << "Bytes recovered: " << bytes_written << endl;
+                } else {
+                    cout << "Partial file remains as: " << output_filename << endl;
+                }
+                
+                cout << "\n=== Partial Transfer Statistics ===" << endl;
+                cout << "Packets successfully received: " << (expected_seq > 0 ? expected_seq : 0) << endl;
+                cout << "Bytes written: " << bytes_written << endl;
+                cout << "Last expected packet: " << expected_seq << endl;
+                cout << " Transfer FAILED due to server disconnection." << endl;
+                return;
+            }
+            continue; // Continue waiting for more packets
+        }
+
+        if (activity < 0) {
+            perror("Select error");
             break;
         }
 
         n = recvfrom(sockfd, &packet, sizeof(packet), 0, (sockaddr*)&serv, &len);
         if (n < 0) {
             perror("Error receiving packet");
-            break;
+            consecutive_timeouts++;
+            continue;
         }
 
+        // Reset timeout counter on successful packet reception
+        consecutive_timeouts = 0;
         packets_received++;
 
         // Simulate packet loss (except for first few packets to ensure progress)
@@ -206,7 +246,7 @@ void receive_file_gobackn(int sockfd, sockaddr_in &serv, const string &filename)
             continue;
         }
 
-        cout << "Received packet " << packet.seq_num << " (size: " << packet.size 
+        cout << "✓ Received packet " << packet.seq_num << " (size: " << packet.size 
              << ", expected: " << expected_seq << ")" << endl;
 
         if (packet.seq_num == expected_seq) {
@@ -227,8 +267,19 @@ void receive_file_gobackn(int sockfd, sockaddr_in &serv, const string &filename)
             // Check if this is the last packet (partial packet)
             if (packet.size < DATA_SIZE) {
                 cout << "Last packet received (size: " << packet.size << " < " << DATA_SIZE << ")" << endl;
-                cout << "Transfer should be complete." << endl;
-                break;
+                cout << "Transfer completed successfully!" << endl;
+                
+                output.close();
+                cout << "\n=== Final Transfer Statistics ===" << endl;
+                cout << "File saved as: " << output_filename << endl;
+                cout << "Total packets received: " << packets_received << endl;
+                cout << "Packets dropped (simulated): " << packets_dropped << endl;
+                cout << "ACKs sent: " << acks_sent << endl;
+                cout << "Final expected sequence: " << expected_seq << endl;
+                cout << "Total bytes written: " << bytes_written << endl;
+                cout << "Loss rate: " << (packets_received > 0 ? (packets_dropped * 100.0 / packets_received) : 0) << "%" << endl;
+                cout << "Transfer completed successfully!" << endl;
+                return;
             }
         } else if (packet.seq_num < expected_seq) {
             // Duplicate packet - send ACK anyway
@@ -247,26 +298,19 @@ void receive_file_gobackn(int sockfd, sockaddr_in &serv, const string &filename)
         }
 
         // Progress update
-        if (packets_received % 100 == 0) {
+        if (packets_received % 50 == 0 && packets_received > 0) {
             cout << "\n=== Progress Update ===" << endl;
             cout << "Packets received: " << packets_received << endl;
             cout << "Bytes written: " << bytes_written << endl;
             cout << "Current expected: " << expected_seq << endl;
+            cout << "Consecutive timeouts: " << consecutive_timeouts << "/" << MAX_CONSECUTIVE_TIMEOUTS << endl;
             cout << "======================\n" << endl;
         }
     }
 
+    // This should only be reached if there was an unexpected error
     output.close();
-    
-    cout << "\n=== Transfer Statistics ===" << endl;
-    cout << "File saved as: " << output_filename << endl;
-    cout << "Total packets received: " << packets_received << endl;
-    cout << "Packets dropped (simulated): " << packets_dropped << endl;
-    cout << "ACKs sent: " << acks_sent << endl;
-    cout << "Final expected sequence: " << expected_seq << endl;
-    cout << "Total bytes written: " << bytes_written << endl;
-    cout << "Loss rate: " << (packets_received > 0 ? (packets_dropped * 100.0 / packets_received) : 0) << "%" << endl;
-    cout << "Transfer completed!" << endl;
+    cout << "\n Transfer ended unexpectedly!" << endl;
 }
 
 int main(){
